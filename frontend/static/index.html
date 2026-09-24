@@ -792,8 +792,17 @@ function renderReply(b, parts) {
   const texts = parts.filter(p => p && (p.kind === "text" || (!p.kind && p.text))).map(p => p.text || "");
   const a2ui = parts.filter(p => p && p.kind === "a2ui" && p.data).map(p => p.data);
 
-  const textStr = texts.join("\n").trim();
-  if (textStr) b.appendChild(el("div", null, textStr));
+  let textStr = texts.join("\n").trim();
+  
+  if (textStr) {
+    const textDiv = el("div");
+    // Format text: convert markdown links [text](url) and raw URLs to HTML
+    let formattedHtml = escapeHtml(textStr)
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^\s\)]+)\)/g, '<a href="$2" target="_blank" style="color:var(--accent); font-weight:600; text-decoration:underline;">$1</a>')
+      .replace(/(^|[^"])((https?:\/\/storage\.googleapis\.com\/[^\s"'\)\>\`\]]+))/gi, '$1<a href="$2" target="_blank" style="color:var(--accent); font-weight:600; text-decoration:underline;">$2</a>');
+    textDiv.innerHTML = formattedHtml;
+    b.appendChild(textDiv);
+  }
 
   if (a2ui.length) {
     b.classList.add("rich");
@@ -801,19 +810,51 @@ function renderReply(b, parts) {
   }
 
   const fullPayloadStr = JSON.stringify(parts);
-  const mp4Matches = fullPayloadStr.match(/https:\/\/[^\s"'\)]+\.mp4/gi);
-  if (mp4Matches && mp4Matches.length) {
-    const uniqueMp4s = [...new Set(mp4Matches)];
-    uniqueMp4s.forEach(url => {
+  
+  // Extract all Cloud Storage media URLs
+  const storageUrlMatches = fullPayloadStr.match(/https:\/\/storage\.googleapis\.com\/[^\s"'\)\>\`\]]+/gi) || [];
+  const uniqueUrls = [...new Set(storageUrlMatches)];
+
+  uniqueUrls.forEach(url => {
+    // Check if Video
+    if (/\.(mp4|webm|mov)(\?.*)?$/i.test(url) || url.includes("/video_")) {
       if (!b.querySelector(`video[src="${url}"]`)) {
+        const vidContainer = el("div");
+        vidContainer.style.marginTop = "0.75rem";
+        vidContainer.style.width = "100%";
+
         const vid = el("video", "a2vid");
-        vid.src = url; vid.controls = true; vid.autoplay = true; vid.muted = true; vid.playsInline = true;
-        vid.style.maxWidth = "100%"; vid.style.borderRadius = "12px"; vid.style.marginTop = "0.6rem"; vid.style.display = "block";
-        vid.style.boxShadow = "0 4px 10px rgba(0,0,0,0.1)";
-        b.appendChild(vid);
+        vid.src = url;
+        vid.controls = true;
+        vid.autoplay = true;
+        vid.muted = true;
+        vid.playsInline = true;
+        vid.style.maxWidth = "100%";
+        vid.style.width = "100%";
+        vid.style.borderRadius = "12px";
+        vid.style.display = "block";
+        vid.style.boxShadow = "0 4px 14px rgba(0,0,0,0.12)";
+        vid.style.border = "1px solid var(--border)";
+
+        vidContainer.appendChild(vid);
+        b.appendChild(vidContainer);
       }
-    });
-  }
+    } 
+    // Check if Image
+    else if (/\.(png|jpg|jpeg|webp|gif)(\?.*)?$/i.test(url) || url.includes("/recipe_")) {
+      if (!b.querySelector(`img[src="${url}"]`)) {
+        const img = el("img", "a2img");
+        img.src = url;
+        img.alt = "Generated Dish Plating";
+        img.style.maxWidth = "100%";
+        img.style.borderRadius = "12px";
+        img.style.marginTop = "0.75rem";
+        img.style.display = "block";
+        img.style.boxShadow = "0 4px 12px rgba(0,0,0,0.1)";
+        b.appendChild(img);
+      }
+    }
+  });
 
   if (!b.childNodes.length) b.textContent = "(no response)";
   log.scrollTop = log.scrollHeight;
