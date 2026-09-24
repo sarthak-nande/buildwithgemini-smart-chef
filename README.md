@@ -10,6 +10,11 @@ An intelligent personal culinary and nutrition AI assistant built with **Google 
 
 Smart Chef is powered by a set of custom tools and Google Cloud services wired directly into the agent runtime:
 
+### 🔐 User Authentication & Persistent Multi-Session Chat History
+- **Firestore User Authentication (`/api/auth/register`, `/api/auth/login`)**: Supports user registration and login with local session state and a 1-click **⚡ Quick Demo Login**.
+- **Per-User Chat Session Storage (`/api/chats`, `/api/chats/new`, `/api/chats/{chat_id}`)**: Stores chat history transcripts persistently in Cloud Firestore.
+- **Interactive Sidebar UI**: Dynamic left sidebar featuring user profile avatar, "+ New Chat" session creation button, and a list of past conversation sessions that reload on click.
+
 ### 🧠 Cross-Session Personal Memory
 - **Vertex AI Memory Bank (`VertexAiMemoryBankService`)**: Automatically remembers user dietary preferences, food allergies, macro targets, pantry inventory, and kitchen equipment across conversations.
 - **Preload Memory Tool (`PreloadMemoryTool`)**: Inject persistent user context directly into every request.
@@ -43,11 +48,11 @@ Smart Chef integrates the following Google Cloud services:
 
 - **Vertex AI Agent Engine / Agent Runtime**: Serverless runtime hosting the ADK agent framework.
 - **Vertex AI Memory Bank**: Managed memory service storing long-term user preferences and facts.
-- **Google Cloud Firestore**: Document database powering user recipe storage.
+- **Google Cloud Firestore**: Document database powering user accounts, chat sessions, message transcripts, and recipe storage.
 - **Google Cloud Storage**: Public media storage bucket for generated dish images and video clips.
 - **Vertex AI Imagen 3**: Text-to-image generation for dish plating visualizations.
 - **Vertex AI Gemini Omni**: Multimodal interaction model generating culinary video clips.
-- **Cloud Run & FastAPI**: Microservice proxy serving the A2A protocol and custom chat interface.
+- **Cloud Run & FastAPI**: Microservice proxy serving the A2A protocol, authentication, chat history APIs, and custom chat interface.
 
 ---
 
@@ -60,9 +65,9 @@ smart-chef/
 │   ├── fast_api_app.py        # FastAPI Backend server
 │   └── app_utils/             # Memory bank, Firestore, and tool helpers
 ├── frontend/
-│   ├── main.py                # FastAPI proxy forwarding A2A protocol requests
+│   ├── main.py                # FastAPI proxy with Auth, Chat History APIs & A2A protocol
 │   └── static/
-│       └── index.html         # Custom chat interface & A2UI + Video renderer
+│       └── index.html         # Custom chat interface, Sidebar, Auth Modal, A2UI & Video renderer
 ├── agents-cli-manifest.yaml   # Agent Engine deployment configuration
 ├── project_brief.md           # Project architecture overview
 └── demo.gif                   # Looping video recording of the agent in action

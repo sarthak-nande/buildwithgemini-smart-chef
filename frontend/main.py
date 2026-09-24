@@ -1,30 +1,12 @@
-"""Minimal FastAPI proxy for a deployed A2A agent (Agent Runtime, agents-cli 1.1.0+).
+"""Minimal FastAPI proxy for a deployed A2A agent with User Auth and Firestore Chat History.
 
 The browser talks ONLY to this proxy (same origin, no CORS, no GCP creds in the
-browser). The proxy authenticates with Application Default Credentials and
-forwards chat to the deployed agent over the A2A protocol, returning replies as
-structured parts the chat UI knows how to show:
-
-  * {"kind": "text", "text": ...}  -> a normal chat bubble
-  * {"kind": "a2ui", "data": ...}  -> one A2UI message (beginRendering /
-    surfaceUpdate); static/index.html renders these as a card.
-
-Why A2A: agents-cli 1.1.0 (GA) deploys ADK agents to Agent Runtime as A2A agents
-and no longer registers the reasoning-engine operation schema the old
-`agent_engines.get(...).stream_query()` path relied on (operation_schemas() comes
-back empty). The container serves the A2A protocol over the Agent Engine HTTP
-passthrough, so this proxy fetches the agent's card and sends messages with the
-a2a-sdk client (the same path `agents-cli run --mode a2a` uses). This works for
-both A2A and plain ADK 1.1.0 deployments (the container serves A2A either way).
-
-Run:
-  pip install -r requirements.txt
-  export AGENT_ENGINE_RESOURCE_NAME="projects/.../locations/.../reasoningEngines/..."
-  export AGENT_DIRECTORY="app"   # your agent's app directory (agents-cli-manifest.yaml)
-  python main.py                 # -> http://localhost:8080
+browser). The proxy authenticates with Application Default Credentials, manages
+user auth and chat history in Cloud Firestore, and forwards chat to the deployed agent.
 """
 
 import os
+import time
 import uuid
 
 import google.auth
@@ -44,25 +26,22 @@ from a2a.types import (
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from google.cloud import firestore
 
 RESOURCE = os.environ["AGENT_ENGINE_RESOURCE_NAME"]
-# The agent's app directory (matches agent_directory in agents-cli-manifest.yaml).
 AGENT_DIRECTORY = os.environ.get("AGENT_DIRECTORY", "app")
-# Location is embedded in the resource name: projects/<p>/locations/<loc>/reasoningEngines/<id>.
 LOCATION = RESOURCE.split("/locations/")[1].split("/")[0]
 
-# A2A endpoint for an Agent Runtime deployment, via the Agent Engine HTTP
-# passthrough. The card lives at the well-known path under this base.
+FIRESTORE_PROJECT = os.environ.get("FIRESTORE_PROJECT", "qwiklabs-gcp-01-69e8752c22fd")
+db = firestore.Client(project=FIRESTORE_PROJECT)
+
 A2A_BASE = (
     f"https://{LOCATION}-aiplatform.googleapis.com/reasoningEngines/v1/"
     f"{RESOURCE}/api/a2a/{AGENT_DIRECTORY}"
 )
 A2A_CARD_URL = f"{A2A_BASE}/.well-known/agent-card.json"
-
-# The agent tags its A2UI data parts with this mime type.
 _A2UI_MIME = "application/json+a2ui"
 
-# One set of ADC credentials, refreshed per request (access tokens expire ~1h).
 _creds, _ = google.auth.default(
     scopes=["https://www.googleapis.com/auth/cloud-platform"]
 )
@@ -81,10 +60,6 @@ app = FastAPI()
 
 @app.exception_handler(Exception)
 async def _json_errors(request: Request, exc: Exception):
-    # Always return JSON so the browser never receives a plain-text 500 page
-    # (which shows up in the chat as "Unexpected token 'I', "Internal S"... is
-    # not valid JSON"). Any server-side failure now surfaces as a readable
-    # message in the chat bubble instead.
     return JSONResponse(
         status_code=200,
         content={
@@ -93,9 +68,8 @@ async def _json_errors(request: Request, exc: Exception):
     )
 
 
-# Reuse ONE A2A context per user so the agent remembers the conversation.
+# Context per user_id:chat_id pair
 _contexts: dict[str, str] = {}
-# Cache the agent card after the first fetch.
 _card: AgentCard | None = None
 
 
@@ -105,21 +79,12 @@ async def _get_card(client: httpx.AsyncClient) -> AgentCard:
         resp = await client.get(A2A_CARD_URL)
         resp.raise_for_status()
         card = AgentCard(**resp.json())
-        # Agent Runtime does not serve a public card URL, so point the client at
-        # the passthrough base for message sends.
         card.url = A2A_BASE
         _card = card
     return _card
 
 
 def _extract_parts(parts: list) -> list[dict]:
-    """Turn A2A response parts into structured parts for the chat UI.
-
-    Text parts pass through as {"kind": "text"}. A2UI data parts (tagged
-    application/json+a2ui) become {"kind": "a2ui", "data": <message>} so the UI
-    renders the card; each data part is one A2UI message (beginRendering or
-    surfaceUpdate).
-    """
     out: list[dict] = []
     for p in parts:
         root = getattr(p, "root", p)
@@ -137,11 +102,150 @@ def _extract_parts(parts: list) -> list[dict]:
     return out
 
 
+# --- User Authentication Endpoints ---
+
+@app.post("/api/auth/register")
+async def register(req: Request):
+    body = await req.json()
+    username = body.get("username", "").strip().lower()
+    password = body.get("password", "").strip()
+    name = body.get("name", "").strip() or username.title()
+
+    if not username or not password:
+        return JSONResponse({"status": "error", "message": "Username and password required."}, status_code=400)
+
+    user_ref = db.collection("users").document(username)
+    if user_ref.get().exists:
+        return JSONResponse({"status": "error", "message": "Username already exists. Please login."}, status_code=400)
+
+    user_data = {
+        "username": username,
+        "password": password,  # simple demonstration auth
+        "name": name,
+        "created_at": time.time(),
+    }
+    user_ref.set(user_data)
+    return JSONResponse({"status": "success", "username": username, "name": name})
+
+
+@app.post("/api/auth/login")
+async def login(req: Request):
+    body = await req.json()
+    username = body.get("username", "").strip().lower()
+    password = body.get("password", "").strip()
+
+    if not username:
+        return JSONResponse({"status": "error", "message": "Username is required."}, status_code=400)
+
+    user_ref = db.collection("users").document(username)
+    user_doc = user_ref.get()
+
+    if not user_doc.exists:
+        # Auto-create profile for demo user or new login
+        name = username.title()
+        user_ref.set({
+            "username": username,
+            "password": password,
+            "name": name,
+            "created_at": time.time(),
+        })
+        return JSONResponse({"status": "success", "username": username, "name": name})
+
+    data = user_doc.to_dict()
+    if data.get("password") and data.get("password") != password:
+        return JSONResponse({"status": "error", "message": "Incorrect password."}, status_code=400)
+
+    return JSONResponse({"status": "success", "username": username, "name": data.get("name", username.title())})
+
+
+# --- Chat History Endpoints ---
+
+@app.get("/api/chats")
+async def list_chats(user_id: str):
+    if not user_id:
+        return JSONResponse({"sessions": []})
+    
+    sessions_ref = db.collection("users").document(user_id).collection("sessions")
+    docs = sessions_ref.order_by("updated_at", direction=firestore.Query.DESCENDING).stream()
+    
+    sessions = []
+    for doc in docs:
+        d = doc.to_dict()
+        sessions.append({
+            "id": doc.id,
+            "title": d.get("title", "New Chat"),
+            "created_at": d.get("created_at", 0),
+            "updated_at": d.get("updated_at", 0),
+        })
+    return JSONResponse({"sessions": sessions})
+
+
+@app.post("/api/chats/new")
+async def new_chat(req: Request):
+    body = await req.json()
+    user_id = body.get("user_id") or "guest"
+    chat_id = str(uuid.uuid4())
+    now = time.time()
+
+    session_ref = db.collection("users").document(user_id).collection("sessions").document(chat_id)
+    session_ref.set({
+        "title": "New Chat",
+        "created_at": now,
+        "updated_at": now,
+    })
+    return JSONResponse({"chat_id": chat_id, "title": "New Chat"})
+
+
+@app.get("/api/chats/{chat_id}")
+async def get_chat_history(chat_id: str, user_id: str):
+    if not user_id or not chat_id:
+        return JSONResponse({"messages": []})
+
+    messages_ref = db.collection("users").document(user_id).collection("sessions").document(chat_id).collection("messages")
+    docs = messages_ref.order_by("timestamp", direction=firestore.Query.ASCENDING).stream()
+
+    messages = [doc.to_dict() for doc in docs]
+    return JSONResponse({"chat_id": chat_id, "messages": messages})
+
+
+# --- Primary Chat Relay Endpoint ---
+
 @app.post("/chat")
 async def chat(req: Request):
     body = await req.json()
     message = body.get("message", "")
-    user_id = body.get("user_id") or "web-user"
+    user_id = body.get("user_id") or "guest"
+    chat_id = body.get("chat_id") or str(uuid.uuid4())
+    context_key = f"{user_id}:{chat_id}"
+    now = time.time()
+
+    # 1. Save user message to Firestore
+    session_ref = db.collection("users").document(user_id).collection("sessions").document(chat_id)
+    session_doc = session_ref.get()
+
+    if not session_doc.exists:
+        title = message[:35] + ("..." if len(message) > 35 else "") or "New Chat"
+        session_ref.set({
+            "title": title,
+            "created_at": now,
+            "updated_at": now,
+        })
+    else:
+        current_data = session_doc.to_dict()
+        if current_data.get("title") == "New Chat" and message:
+            title = message[:35] + ("..." if len(message) > 35 else "")
+            session_ref.update({"title": title, "updated_at": now})
+        else:
+            session_ref.update({"updated_at": now})
+
+    msg_id_user = str(uuid.uuid4())
+    user_msg_data = {
+        "role": "user",
+        "parts": [{"kind": "text", "text": message}],
+        "timestamp": now,
+    }
+    session_ref.collection("messages").document(msg_id_user).set(user_msg_data)
+
     parts: list[dict] = []
 
     async with httpx.AsyncClient(headers=_auth_headers(), timeout=120) as client:
@@ -161,7 +265,7 @@ async def chat(req: Request):
             message_id=str(uuid.uuid4()),
             role=Role.user,
             parts=[Part(root=TextPart(text=message))],
-            context_id=_contexts.get(user_id),
+            context_id=_contexts.get(context_key),
         )
 
         last_task = None
@@ -173,28 +277,33 @@ async def chat(req: Request):
             if task is not None:
                 last_task = task
                 if getattr(task, "context_id", None):
-                    _contexts[user_id] = task.context_id
+                    _contexts[context_key] = task.context_id
             if isinstance(update, TaskArtifactUpdateEvent):
                 got_artifact_update = True
                 parts.extend(_extract_parts(update.artifact.parts))
 
-        # Non-streaming fallback: pull parts from the final task's artifacts.
         if not got_artifact_update and last_task is not None:
             for artifact in getattr(last_task, "artifacts", None) or []:
                 parts.extend(_extract_parts(artifact.parts))
 
     if not parts:
-        # The turn produced no text or UI (e.g. the agent only ran tools, or a
-        # tool stalled). Be honest rather than silent.
         parts = [{"kind": "text", "text": "(The agent didn't return a reply.)"}]
-    return JSONResponse({"parts": parts})
+
+    # 2. Save agent response to Firestore
+    msg_id_agent = str(uuid.uuid4())
+    agent_msg_data = {
+        "role": "model",
+        "parts": parts,
+        "timestamp": time.time(),
+    }
+    session_ref.collection("messages").document(msg_id_agent).set(agent_msg_data)
+
+    return JSONResponse({"parts": parts, "chat_id": chat_id})
 
 
-# Serve the chat UI (keep this mount last so /chat wins).
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
